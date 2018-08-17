@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 # Preparing data
 This repo only provide the way to create the PnP dataset.
-Find the file pnp_outliers_dataset.ipynb in the folder datasets. Run it. You will find the dataset in the ./datasets which contains data for training, testing and validation.
+Find the file pnp_outliers_dataset.ipynb in the folder datasets. Run it. You will find the dataset in the `./datasets` which contains data for training, testing and validation.
 
 # Training
 
@@ -47,9 +47,9 @@ Again, testing is quite simple. After training is done, run:
 ./main.py --run_mode=test
 ```
 
-You could find our the model which trained by us in the folder model_best. You have to move these two files to the dir ./res/logs/
+You could find our the model which trained by us in the folder `./model_best`. You have to move these two files to the dir `./res/logs/`.
 
-P.S. I changed the experiment setting, fix the number of matches to be 200 in the training process, for the reason that we found this will give us better result. The parameter what we use is $\alpha=10， \beta=5\times 10^{-3}$
+P.S. I changed the experiment setting, fix the number of matches to be 200 in the training process, for the reason that we found this will give us better result. The parameter what we are using is `alpha=10., beta=5.e-3`.
 
 
 
