@@ -49,7 +49,7 @@ Again, testing is quite simple. After training is done, run:
 
 You could find our the model which trained by us in the folder model_best. You have to move these two files to the dir ./res/logs/
 
-P.S. I changed the experiment setting, fix the number of matches to be 200 in the training process, for the reason that we found this will give us better result. The parameter what we use is $\alpha=10$, $\beta=5\times 10^{-3}$
+P.S. I changed the experiment setting, fix the number of matches to be 200 in the training process, for the reason that we found this will give us better result. The parameter what we use is $\alpha=10， \beta=5\times 10^{-3}$
 
 
 
