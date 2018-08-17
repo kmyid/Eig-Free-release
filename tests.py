@@ -34,6 +34,8 @@ import datetime
 import os
 import sys
 import time
+# from time import time
+import IPython
 
 import numpy as np
 from parse import parse
@@ -42,7 +44,6 @@ import cv2
 from six.moves import xrange
 from transformations import quaternion_from_matrix
 from utils import loadh5, saveh5
-
 
 def compute_error_for_find_essential(x1, x2, E):
     # x1.shape == x2.shape == (Np, 3)
@@ -133,14 +134,19 @@ def ourFindEssentialMat(np1, np2, method=cv2.RANSAC, iter_num=1000,
 
 
 def evaluate_R_t(R_gt, t_gt, R, t, q_gt=None):
+    '''
 
-    # from Utils.transformations import quaternion_from_matrix
-
+    :param R_gt: (3,3) or (4,4)
+    :param t_gt:
+    :param R: (3,3) or (4,4)
+    :param t:
+    :param q_gt:
+    :return:
+    '''
     t = t.flatten()
     t_gt = t_gt.flatten()
 
     eps = 1e-15
-
     if q_gt is None:
         q_gt = quaternion_from_matrix(R_gt)
     q = quaternion_from_matrix(R)
@@ -166,7 +172,7 @@ def evaluate_R_t(R_gt, t_gt, R, t, q_gt=None):
     return err_q, err_t
 
 
-def eval_nondecompose(p1s, p2s, E_hat, dR, dt, scores):
+def eval_nondecompose(p1s, p2s, p3s, T_hat, dR, dt, scores):
 
     # Use only the top 10% in terms of score to decompose, we can probably
     # implement a better way of doing this, but this should be just fine.
@@ -174,22 +180,47 @@ def eval_nondecompose(p1s, p2s, E_hat, dR, dt, scores):
     num_top = max(1, num_top)
     th = np.sort(scores)[::-1][num_top]
     mask = scores >= th
-
     p1s_good = p1s[mask]
     p2s_good = p2s[mask]
+    p3s_good = p3s[mask]
 
+    Rij = dR[:, 0, :].reshape(3, 3)
+    Rik = dR[:, 2, :].reshape(3, 3).T
+    tij = dt[:, 0, :].reshape(3, 1)
+    tki = dt[:, 2, :]
+    tik = - np.matmul(Rik, tki.reshape(3, 1))
+
+    # the following code is used for testing.
+    # Rij = dR[0, :].reshape(3,3)
+    # Rik = dR[1, :].reshape(3,3)
+    # tij = dt[0, :]
+    # tik = dt[1, :]
+    # --------------------------------------
+
+    num_inlier = 0
     # Match types
-    E_hat = E_hat.reshape(3, 3).astype(p1s.dtype)
-    if p1s_good.shape[0] >= 5:
-        # Get the best E just in case we get multipl E from findEssentialMat
-        num_inlier, R, t, mask_new = cv2.recoverPose(
-            E_hat, p1s_good, p2s_good)
+    T_hat = T_hat.reshape(3, 3, 3).astype(p1s.dtype)
+    if p1s_good.shape[0] >= 6:
+        # retrieve fundamental matrix from trifocal tensor.
+        F21, F31 = fundamentalMatFormTrifocal(T_hat)
+        # actually this fundamental matrix is essential matrix.
+
+        num_inlier_21, R_21, t_21, mask_21 = cv2.recoverPose(
+            F21, p1s_good, p2s_good)
+        num_inlier_31, R_31, t_31, mask_31 = cv2.recoverPose(
+            F31, p1s_good, p3s_good)
+        mask_new = mask_21 & mask_31
         try:
-            err_q, err_t = evaluate_R_t(dR, dt, R, t)
+            err_q_21, err_t_21 = evaluate_R_t(Rij, tij, R_21, t_21)
+            err_q_31, err_t_31 = evaluate_R_t(Rik, tik, R_31, t_31)
+            err_q = np.maximum(err_q_21, err_q_31)
+            err_t = np.maximum(err_t_21, err_t_31)
         except:
             print("Failed in evaluation")
-            print(R)
-            print(t)
+            print(R_21)
+            print(t_21)
+            print(R_31)
+            print(t_31)
             err_q = np.pi
             err_t = np.pi / 2
     else:
@@ -198,20 +229,18 @@ def eval_nondecompose(p1s, p2s, E_hat, dR, dt, scores):
 
     loss_q = np.sqrt(0.5 * (1 - np.cos(err_q)))
     loss_t = np.sqrt(1.0 - np.cos(err_t)**2)
-
     # Change mask type
     mask = mask.flatten().astype(bool)
-
     mask_updated = mask.copy()
     if mask_new is not None:
         # Change mask type
         mask_new = mask_new.flatten().astype(bool)
         mask_updated[mask] = mask_new
-
+        num_inlier = np.sum(mask.flatten().astype(float))
     return err_q, err_t, loss_q, loss_t, np.sum(num_inlier), mask_updated
 
 
-def eval_decompose(p1s, p2s, dR, dt, mask=None, method=cv2.LMEDS, probs=None,
+def eval_decompose(p1s, p2s, p3s, dR, dt, mask=None, method=cv2.LMEDS, probs=None,
                    weighted=False, use_prob=True):
     if mask is None:
         mask = np.ones((len(p1s),), dtype=bool)
@@ -221,39 +250,60 @@ def eval_decompose(p1s, p2s, dR, dt, mask=None, method=cv2.LMEDS, probs=None,
     # Mask the ones that will not be used
     p1s_good = p1s[mask]
     p2s_good = p2s[mask]
+    p3s_good = p3s[mask]
+
+    Rij = dR[:, 0, :].reshape(3, 3)
+    Rik = dR[:, 2, :].reshape(3, 3).T
+    tij = dt[:, 0, :].reshape(3, 1)
+    tki = dt[:, 2, :]
+    tik = - np.matmul(Rik, tki.reshape(3, 1))
+
+    # the following code is used for testing.
+    # Rij = dR[0, :].reshape(3, 3)
+    # Rik = dR[1, :].reshape(3, 3)
+    # tij = dt[0, :]
+    # tik = dt[1, :]
+
+
     probs_good = None
     if probs is not None:
         probs_good = probs[mask]
 
     num_inlier = 0
     mask_new2 = None
-    if p1s_good.shape[0] >= 5:
+    if p1s_good.shape[0] >= 6:
         if probs is None and method != "MLESAC":
-            E, mask_new = cv2.findEssentialMat(
-                p1s_good, p2s_good, method=method, threshold=0.01)
+            try:
+                T, mask_new = trifocal_from_pts(p1s_good, p2s_good, p3s_good)
+            except:
+                IPython.embed()
+                T = None
         else:
-            E, mask_new = ourFindEssentialMat(
-                p1s_good, p2s_good, method=method, threshold=0.01,
-                probs=probs_good, weighted=weighted, use_prob=use_prob)
-        if E is not None:
-            new_RT = False
-            # Get the best E just in case we get multipl E from
-            # findEssentialMat
-            for _E in np.split(E, len(E) / 3):
-                _num_inlier, _R, _t, _mask_new2 = cv2.recoverPose(
-                    _E, p1s_good, p2s_good, mask=mask_new)
-                if _num_inlier > num_inlier:
-                    num_inlier = _num_inlier
-                    R = _R
-                    t = _t
-                    mask_new2 = _mask_new2
-                    new_RT = True
-            if new_RT:
-                err_q, err_t = evaluate_R_t(dR, dt, R, t)
+            # E, mask_new = ourFindEssentialMat(
+            #     p1s_good, p2s_good, method=method, threshold=0.01,
+            #     probs=probs_good, weighted=weighted, use_prob=use_prob)
+            raise NotImplementedError("TODO")
+
+        if T is not None:
+            F21, F31 = fundamentalMatFormTrifocal(T)
+            _, R_21, t_21, mask_21 = cv2.recoverPose(
+                F21, p1s_good, p2s_good, mask=mask_new)
+            _, R_31, t_31, mask_31 = cv2.recoverPose(
+                F31, p1s_good, p3s_good, mask=mask_new)
+            # print(R_21)
+            # print(t_21)
+            # print(R_31)
+            # print(t_31)
+            mask_new2 = mask_21 & mask_31
+            num_inlier = np.sum(mask_new2.flatten().astype(float))
+            if num_inlier > 6:
+                err_q_21, err_t_21 = evaluate_R_t(Rij, tij, R_21, t_21)
+                err_q_31, err_t_31 = evaluate_R_t(Rik, tik, R_31, t_31)
+                err_q = np.maximum(err_q_21, err_q_31)
+                err_t = np.maximum(err_t_21, err_t_31)
             else:
                 err_q = np.pi
                 err_t = np.pi / 2
-
         else:
             err_q = np.pi
             err_t = np.pi / 2
@@ -269,7 +319,7 @@ def eval_decompose(p1s, p2s, dR, dt, mask=None, method=cv2.LMEDS, probs=None,
         # Change mask type
         mask_new2 = mask_new2.flatten().astype(bool)
         mask_updated[mask] = mask_new2
-
+    num_inlier = np.sum(mask_updated.flatten().astype(float))
     return err_q, err_t, loss_q, loss_t, np.sum(num_inlier), mask_updated
 
 
@@ -372,7 +422,7 @@ def test_process(mode, sess,
                  cur_global_step, merged_summary_op, summary_writer,
                  x, y, R, t, is_training,
                  img1, img2, r,
-                 logits_mean, e_hat, loss,
+                 logits_mean, T_hat, loss,
                  data,
                  res_dir, config, va_res_only=False):
 
@@ -394,24 +444,23 @@ def test_process(mode, sess,
     ys = data["ys"]
     Rs = data["Rs"]
     ts = data["ts"]
-    img1s = data["img1s"]
-    cx1s = data["cx1s"]
-    cy1s = data["cy1s"]
-    f1s = data["f1s"]
-    img2s = data["img2s"]
-    cx2s = data["cx2s"]
-    cy2s = data["cy2s"]
-    f2s = data["f2s"]
-
+    # img1s = data["img1s"]
+    # cx1s = data["cx1s"]
+    # cy1s = data["cy1s"]
+    # f1s = data["f1s"]
+    # img2s = data["img2s"]
+    # cx2s = data["cx2s"]
+    # cy2s = data["cy2s"]
+    # f2s = data["f2s"]
+ 
     # Validation
     num_sample = len(xs)
 
-    test_list = []
-    if va_res_only:
-        test_list += [
-            "ours",
-        ]
-    else:
+    test_list = [
+        "ours",
+        # "ours_ransac",
+    ]
+    if not va_res_only:
         test_list += [
             "ours_ransac",
             # "ours_usac5point",
@@ -434,34 +483,35 @@ def test_process(mode, sess,
         for _test in test_list:
             eval_res[measure][_test] = np.zeros(num_sample)
 
-    e_hats = []
+    T_hats = []
     y_hats = []
     # Run every test independently. might have different number of keypoints
     for idx_cur in xrange(num_sample):
         # Use minimum kp in batch to construct the batch
         _xs = np.array(
             xs[idx_cur][:, :, :]
-        ).reshape(1, 1, -1, 4)
+        ).reshape(1, 1, -1, 8)
         _ys = np.array(
-            ys[idx_cur][:, :]
-        ).reshape(1, -1, 2)
-        _dR = np.array(Rs[idx_cur]).reshape(1, 9)
-        _dt = np.array(ts[idx_cur]).reshape(1, 3)
+            ys[idx_cur][:]
+        ).reshape(1, -1, 1)
+        _dR = np.array(Rs[idx_cur]).reshape(1, 3, 9)
+        _dt = np.array(ts[idx_cur]).reshape(1, 3, 3)
         # Create random permutation indices
         feed_dict = {
             x: _xs,
             y: _ys,
             R: _dR,
             t: _dt,
-            is_training:  config.net_bn_test_is_training,
+            is_training: config.net_bn_test_is_training,
         }
         fetch = {
-            "e_hat": e_hat,
-            "y_hat": logits_mean,
+            "T_hat": T_hat,  # trifocal tensor by using 6 points algorithm.
+            "y_hat": logits_mean,  # label predicted by the network.
             "loss": loss,
             # "summary": merged_summary_op,
             # "global_step": global_step,
         }
+
         # print("Running network for {} correspondences".format(
         #     _xs.shape[2]
         # ))
@@ -473,24 +523,25 @@ def test_process(mode, sess,
         #     float(time_diff.total_seconds() * 1000.0)
         # ))
         time_us += [time_diff.total_seconds() * 1000.0]
-
-        e_hats.append(res["e_hat"])
+        T_hats.append(res["T_hat"])
         y_hats.append(res["y_hat"])
 
     for cur_val_idx in xrange(num_sample):
-        _xs = xs[cur_val_idx][:, :, :].reshape(1, 1, -1, 4)
-        _ys = ys[cur_val_idx][:, :].reshape(1, -1, 2)
-        _dR = Rs[cur_val_idx]
-        _dt = ts[cur_val_idx]
-        e_hat_out = e_hats[cur_val_idx].flatten()
+        _xs = xs[cur_val_idx][:, :, :].reshape(1, 1, -1, 8)
+        # _ys = ys[cur_val_idx][:, :].reshape(1, -1, 1)
+        _dR = Rs[cur_val_idx].reshape(1, 3, 9)
+        _dt = ts[cur_val_idx].reshape(1, 3, 3)  # todo: these data are used for what?
+
+        T_hat_out = T_hats[cur_val_idx].flatten()
         y_hat_out = y_hats[cur_val_idx].flatten()
         if len(y_hat_out) != _xs.shape[2]:
             y_hat_out = np.ones(_xs.shape[2])
         # Eval decompose for all pairs
-        _xs = _xs.reshape(-1, 4)
+        _xs = _xs.reshape(-1, 8)
         # x coordinates
-        _x1 = _xs[:, :2]
-        _x2 = _xs[:, 2:]
+        _x1 = _xs[:, :2]  # (kps, 2)
+        _x2 = _xs[:, 2:4]
+        _x3 = _xs[:, 6:]  # for the third view
         # current validity from network
         _valid = y_hat_out.flatten()
         # choose top ones (get validity threshold)
@@ -514,20 +565,23 @@ def test_process(mode, sess,
                 _weighted = False
 
             if _eval_func == "non-decompose":
+                # this is just using DLT to get the trifocal tensor.
                 _err_q, _err_t, _, _, _num_inlier, \
                     _ = eval_nondecompose(
-                        _x1, _x2, e_hat_out, _dR, _dt, y_hat_out)
+                        _x1, _x2, _x3, T_hat_out, _dR, _dt, y_hat_out)
                 _mask_after = _mask_before
+
             elif _eval_func == "decompose":
-                # print("RANSAC loop with ours")
+                # "6 points algorithm + RANSAC loop with ours"
                 time_start = datetime.datetime.now()
                 _err_q, _err_t, _, _, _num_inlier, \
                     _mask_after = eval_decompose(
-                        _x1, _x2, _dR, _dt, mask=_mask_before,
+                        _x1, _x2, _x3, _dR, _dt, mask=_mask_before,
                         method=_method, probs=_probs,
                         weighted=_weighted, use_prob=_use_prob)
                 time_end = datetime.datetime.now()
                 time_diff = time_end - time_start
+
                 # print("Runtime in milliseconds: {}".format(
                 #     float(time_diff.total_seconds() * 1000.0)
                 # ))
@@ -538,7 +592,7 @@ def test_process(mode, sess,
                 time_start = datetime.datetime.now()
                 _, _, _, _, _, \
                     _mask_tmp = eval_decompose(
-                        _x1, _x2, _dR, _dt,
+                        _x1, _x2, _x3, _dR, _dt,
                         mask=np.ones_like(_mask_before).astype(bool),
                         method=_method, probs=_probs,
                         weighted=_weighted, use_prob=_use_prob)
@@ -1051,6 +1105,254 @@ def comp_process(mode, data, res_dir, config):
 
     print("[{}] {}: End testing".format(config.data_tr, time.asctime()))
 
+
+def calcampose(XXc, XXw):
+    # kps, 3
+    n = np.shape(XXc)[0]
+    K = np.eye(n) - np.ones((n, n))/n
+
+    uw = np.mean(XXw, axis=0)
+    uc = np.mean(XXc, axis=0)
+
+    sigmx2 = np.square(np.matmul(XXw.T, K))
+    sigmx2 = np.mean(np.sum(sigmx2, axis=0))
+    SXY = np.matmul(np.matmul(XXc.T, K), XXw)/n
+    U, D, V_t = np.linalg.svd(SXY)
+    S = np.eye(3)
+    #     if np.linalg.det(SXY) < 0:
+    #         S[2,2]=-1
+    if np.linalg.det(np.matmul(U, V_t)) < 0:
+        S[2,2] = -1
+    R2 = np.matmul(U, np.matmul(S,V_t))
+    D = np.diag(D)
+    c2 = np.trace(np.matmul(D,S))/sigmx2
+    t2 = uc - c2 * np.matmul(R2, uw)
+
+    X = R2[:, 0]
+    Y = R2[:, 1]
+    Z = R2[:, 2]
+    if np.linalg.norm(np.cross(X, Y) - Z) > 2e-2:
+        R2[:, 2] = -Z
+    return R2, t2
+
+def DLT(XXw, xx, mask=None):
+    x = np.expand_dims(XXw[:, 0], axis=-1)
+    y = np.expand_dims(XXw[:, 1], axis=-1)
+    z = np.expand_dims(XXw[:, 2], axis=-1)
+    u = np.expand_dims(xx[:, 0], axis=-1)
+    v = np.expand_dims(xx[:, 1], axis=-1)
+
+    ones = np.ones(np.shape(x))
+    zeros = np.zeros(np.shape(x))
+    M1n = np.concatenate([x, y, z, ones, zeros, zeros, zeros, zeros, \
+                          -u*x, -u*y, -u*z, -u], axis=1)
+    M2n = np.concatenate([zeros, zeros, zeros, zeros, x, y, z, ones, \
+                          -v*x, -v*y, -v*z, -v], axis=1)
+    M = np.concatenate([M1n, M2n], axis=0) # kps, 12
+    M_t = np.transpose(M)
+    if mask is not None:
+        mask = np.ceil(mask)
+        if len(np.shape(mask))is not 2:
+            mask = np.expand_dims(mask, axis=-1)
+        w2n = np.concatenate([mask, mask], axis=0)
+        wM = w2n * M
+        MwM = np.matmul(M_t, wM)
+    else:
+        MwM = np.matmul(M_t, M)
+    e, V = np.linalg.eigh(MwM)
+    v = np.reshape(V[:,0], (3,4))
+    v /= np.linalg.norm(v[2,:3])
+    v *= np.sign(v[2,3])
+    R = v[:,:3]
+    t = np.expand_dims(v[:, 3], axis=-1)
+
+    XXc = np.matmul(R, XXw.T) + np.matlib.repmat(t, 1, np.shape(XXw)[0])
+    R, t = calcampose(XXc.T, XXw)
+    return R,t
+
+def evaluate_R_t_pnp(R_gt, t_gt, R, t, q_gt=None):
+
+    t = t.flatten()
+    t_gt = t_gt.flatten()
+
+    eps = 1e-15
+
+    if q_gt is None:
+        q_gt = quaternion_from_matrix(R_gt)
+    q = quaternion_from_matrix(R)
+    q = q / (np.linalg.norm(q) + eps)
+    q_gt = q_gt / (np.linalg.norm(q_gt) + eps)
+    err_q = np.linalg.norm(q - q_gt)/(np.linalg.norm(q) + eps)
+
+    t = t / (np.linalg.norm(t) + eps)
+    t_gt = t_gt / (np.linalg.norm(t_gt) + eps)
+    err_t = np.linalg.norm(t - t_gt)/(np.linalg.norm(t) + eps)
+    if np.sum(np.isnan(err_q)) or np.sum(np.isnan(err_t)):
+        import IPython
+        IPython.embed()
+
+    return err_q, err_t
+
+def test_process(mode, sess, cur_global_step, summary_writer,
+                         x, R, t, is_training, data,
+                         res_dir, config, va_res_only=False, w=None, delta=None):
+    import tensorflow as tf
+    # only the pure-DLT would be enough.
+    if mode == "test":
+        print("[{}] {}: Start testing".format(config.data_tr, time.asctime()))
+        xs_mat = []
+        ws_mat = []
+    # Unpack some references
+    xs = data["xs"]
+    Rs = data["Rs"]
+    ts = data["ts"]
+    num_sample = len(xs)
+
+    test_list = [
+        "pure_DLT",
+    ]
+    if va_res_only == True:
+        test_list = [
+            "pure_DLT",
+        ]
+
+    eval_res = {}
+    measure_list = ["err_q", "err_t"]
+
+    for measure in measure_list:
+        eval_res[measure] = {}
+        for _test in test_list:
+            eval_res[measure][_test] = np.zeros(num_sample)
+
+    # Run every test independently.
+    for idx_cur in xrange(num_sample):
+        _xs = np.array(
+            xs[idx_cur][:, :, :]
+        ).reshape(1, 1, -1, 5)
+        _dR = np.array(Rs[idx_cur]).reshape(1, 3, 3)
+        _dt = np.array(ts[idx_cur]).reshape(1, 3)
+        feed_dict = {
+            x: _xs,
+            R: _dR,
+            t: _dt,
+            is_training: config.net_bn_test_is_training,
+        }
+        fetch = {
+            "w": w,
+        }
+        res = sess.run(fetch, feed_dict=feed_dict)
+
+        if delta is not None:
+            xx = _xs[0, 0, :, :2] + res["delta"][0]
+        else:
+            xx = _xs[0, 0, :, :2]
+
+        XXw = _xs[0, 0, :, 2:]
+
+        if w is not None:
+            R_dlt, t_dlt = DLT(XXw, xx, res["w"][0])
+        else:
+            R_dlt, t_dlt = DLT(XXw, xx, None)
+
+        _err_q, _err_t = evaluate_R_t_pnp(_dR[0], _dt.reshape(3,1), R_dlt, t_dlt)
+        eval_res["err_q"]["pure_DLT"][idx_cur] = _err_q
+        eval_res["err_t"]["pure_DLT"][idx_cur] = _err_t
+        if mode == "test":
+            xs_mat.append(np.concatenate([xx, XXw], axis=1))
+            ws_mat.append(res["w"][0])
+
+    summaries = []
+    ret_val = 0
+    for _tag in test_list:
+        for _sub_tag in measure_list:
+            summaries.append(
+                tf.Summary.Value(
+                    tag="ErrorComputation/" + _tag,
+                    simple_value=np.median(eval_res[_sub_tag][_tag])
+                )
+            )
+
+            # For median error
+            ofn = os.path.join(
+                res_dir, mode, "median_{}_{}.txt".format(_sub_tag, _tag))
+            with open(ofn, "w") as ofp:
+                ofp.write("{}\n".format(
+                    np.median(eval_res[_sub_tag][_tag])))
+
+        ths = np.arange(7) * 0.2
+        cur_err_q = np.array(eval_res["err_q"][_tag]) * 180.0 / np.pi
+        cur_err_t = np.array(eval_res["err_t"][_tag]) * 180.0 / np.pi
+        # Get histogram
+        q_acc_hist, _ = np.histogram(cur_err_q, ths)
+        t_acc_hist, _ = np.histogram(cur_err_t, ths)
+        qt_acc_hist, _ = np.histogram(np.maximum(cur_err_q, cur_err_t), ths)
+        num_pair = float(len(cur_err_q))
+        q_acc_hist = q_acc_hist.astype(float) / num_pair
+        t_acc_hist = t_acc_hist.astype(float) / num_pair
+        qt_acc_hist = qt_acc_hist.astype(float) / num_pair
+        q_acc = np.cumsum(q_acc_hist)
+        t_acc = np.cumsum(t_acc_hist)
+        qt_acc = np.cumsum(qt_acc_hist)
+        # Store return val
+        if _tag == "pure_DLT":
+            ret_val = np.mean(qt_acc[:4])  # 1 == 5
+
+        for _idx_th in xrange(1, len(ths)):
+            summaries += [
+                tf.Summary.Value(
+                    tag="ErrorComputation/acc_q_auc{}_{}".format(
+                        ths[_idx_th], _tag),
+                    simple_value=np.mean(q_acc[:_idx_th]),
+                )
+            ]
+            summaries += [
+                tf.Summary.Value(
+                    tag="ErrorComputation/acc_t_auc{}_{}".format(
+                        ths[_idx_th], _tag),
+                    simple_value=np.mean(t_acc[:_idx_th]),
+                )
+            ]
+            summaries += [
+                tf.Summary.Value(
+                    tag="ErrorComputation/acc_qt_auc{}_{}".format(
+                        ths[_idx_th], _tag),
+                    simple_value=np.mean(qt_acc[:_idx_th]),
+                )
+            ]
+            # for q_auc
+            ofn = os.path.join(
+                res_dir, mode,
+                "acc_q_auc{}_{}.txt".format(ths[_idx_th], _tag))
+            with open(ofn, "w") as ofp:
+                ofp.write("{}\n".format(np.mean(q_acc[:_idx_th])))
+            # for t_auc
+            ofn = os.path.join(
+                res_dir, mode,
+                "acc_t_auc{}_{}.txt".format(ths[_idx_th], _tag))
+            with open(ofn, "w") as ofp:
+                ofp.write("{}\n".format(np.mean(t_acc[:_idx_th])))
+            # for qt_auc
+            ofn = os.path.join(
+                res_dir, mode,
+                "acc_qt_auc{}_{}.txt".format(ths[_idx_th], _tag))
+            with open(ofn, "w") as ofp:
+                ofp.write("{}\n".format(np.mean(qt_acc[:_idx_th])))
+
+    summary_writer.add_summary(
+        tf.Summary(value=summaries), global_step=cur_global_step)
+    if mode == "test":
+        print("[{}] {}: End testing".format(
+            config.data_tr, time.asctime()))
+        import scipy.io
+        dict_mat = {
+            "ws": ws_mat,
+            "xs_te": xs,
+            "Rs_te": Rs,
+            "ts_te": ts,
+        }
+        scipy.io.savemat("./res/denoise.mat", mdict=dict_mat)
+    # Return qt_auc20
+    return ret_val
 
 #
 # test.py ends here

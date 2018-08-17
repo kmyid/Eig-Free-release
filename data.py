@@ -314,11 +314,8 @@ def load_data(config, var_mode):
     var_mode = var_mode[:2]
 
     # Now load data.
-    var_name_list = [
-        "xs", "ys", "Rs", "ts",
-        "img1s", "cx1s", "cy1s", "f1s",
-        "img2s", "cx2s", "cy2s", "f2s",
-    ]
+    var_name_list = ["xs", "Rs", "ts"
+                     ]
 
     data_folder = config.data_dump_prefix
     if config.use_lift:
@@ -331,17 +328,8 @@ def load_data(config, var_mode):
     for data_name in data_names:
         cur_data_folder = "/".join([
             data_folder,
-            data_name,
-            "numkp-{}".format(config.obj_num_kp),
-            "nn-{}".format(config.obj_num_nn),
-        ])
-        if not config.data_crop_center:
-            cur_data_folder = os.path.join(cur_data_folder, "nocrop")
-        suffix = "{}-{}".format(
-            var_mode,
-            getattr(config, "train_max_" + var_mode + "_sample")
-        )
-        cur_folder = os.path.join(cur_data_folder, suffix)
+            data_name])
+        cur_folder = os.path.join(cur_data_folder, var_mode)
         ready_file = os.path.join(cur_folder, "ready")
         if not os.path.exists(ready_file):
             # data_gen_lock.unlock()

@@ -30,7 +30,7 @@
 
 import argparse
 
-from servers import is_computecanada, is_cvlab_epfl, is_vcg_uvic
+from servers import is_computecanada, is_vcg_uvic
 
 
 def str2bool(v):
@@ -69,21 +69,23 @@ net_arg.add_argument(
 net_arg.add_argument(
     "--net_bn_test_is_training", type=str2bool, default=False, help=""
     "is_training value for testing")
-
+net_arg.add_argument(
+    "--method", type=str, default="outliers", help=""
+    "denoise, outliers, combine")
 # -----------------------------------------------------------------------------
 # Data
 data_arg = add_argument_group("Data")
 data_arg.add_argument(
-    "--data_dump_prefix", type=str, default="./data_dump", help=""
+    "--data_dump_prefix", type=str, default="./datasets", help=""
     "prefix for the dump folder locations")
 data_arg.add_argument(
-    "--data_tr", type=str, default="st_peters.brown_bm_3_05", help=""
+    "--data_tr", type=str, default="outlier-rejection", help=""
     "name of the dataset for train")
 data_arg.add_argument(
-    "--data_va", type=str, default="st_peters.brown_bm_3_05", help=""
+    "--data_va", type=str, default="outlier-rejection", help=""
     "name of the dataset for valid")
 data_arg.add_argument(
-    "--data_te", type=str, default="st_peters.brown_bm_3_05", help=""
+    "--data_te", type=str, default="outlier-rejection", help=""
     "name of the dataset for test")
 data_arg.add_argument(
     "--data_crop_center", type=str2bool, default=False, help=""
@@ -91,15 +93,14 @@ data_arg.add_argument(
     "to match the expected input for methods that expect a square input")
 data_arg.add_argument(
     "--use_lift", type=str2bool, default=False, help=""
-    "if this is set to true, we expect lift to be dumped already for all "
+    "if this is set to true, we expect lift to be dumped alread for all "
     "images.")
-
 
 # -----------------------------------------------------------------------------
 # Objective
 obj_arg = add_argument_group("obj")
 obj_arg.add_argument(
-    "--obj_num_kp", type=int, default=2000, help=""
+    "--obj_num_kp", type=int, default=200, help=""
     "number of keypoints per image")
 obj_arg.add_argument(
     "--obj_top_k", type=int, default=-1, help=""
@@ -112,7 +113,7 @@ obj_arg.add_argument(
     "distance matrix")
 obj_arg.add_argument(
     "--obj_geod_type", type=str, default="episym",
-    choices=["sampson", "episqr", "episym"], help=""
+    choices=["sampson", "episqr", "episym", "reproj", "tri3pt"], help=""
     "type of geodesic distance")
 obj_arg.add_argument(
     "--obj_geod_th", type=float, default=1e-4, help=""
@@ -128,10 +129,13 @@ loss_arg.add_argument(
     "--loss_classif", type=float, default=1.0, help=""
     "weight of the classification loss")
 loss_arg.add_argument(
-    "--loss_essential", type=float, default=0.1, help=""
-    "weight of the essential loss")
+    "--alpha", type=float, default=10., help=""
+    "weight of the trifocal loss")
 loss_arg.add_argument(
-    "--loss_essential_init_iter", type=int, default=20000, help=""
+    "--beta", type=float, default=5e-3, help=""
+    "initial iterations to run only the classification loss")
+loss_arg.add_argument(
+    "--gamma", type=float, default=1e-2, help=""
     "initial iterations to run only the classification loss")
 
 # -----------------------------------------------------------------------------
@@ -147,10 +151,10 @@ train_arg.add_argument(
     "--train_max_tr_sample", type=int, default=10000, help=""
     "number of max training samples")
 train_arg.add_argument(
-    "--train_max_va_sample", type=int, default=1000, help=""
+    "--train_max_va_sample", type=int, default=100, help=""
     "number of max validation samples")
 train_arg.add_argument(
-    "--train_max_te_sample", type=int, default=1000, help=""
+    "--train_max_te_sample", type=int, default=100, help=""
     "number of max test samples")
 train_arg.add_argument(
     "--train_lr", type=float, default=1e-3, help=""
@@ -159,10 +163,10 @@ train_arg.add_argument(
     "--train_iter", type=int, default=500000, help=""
     "training iterations to perform")
 train_arg.add_argument(
-    "--res_dir", type=str, default="./logs", help=""
+    "--res_dir", type=str, default="./res", help=""
     "base directory for results")
 train_arg.add_argument(
-    "--log_dir", type=str, default="", help=""
+    "--log_dir", type=str, default="./logs", help=""
     "save directory name inside results")
 train_arg.add_argument(
     "--test_log_dir", type=str, default="", help=""
@@ -194,14 +198,16 @@ def setup_dataset(dataset_name):
     dataset_name = dataset_name.split(".")[0]
 
     # Setup the base directory depending on the environment
-    if is_computecanada():
-        data_dir = "/scratch/kyi/datasets/scenedata_splits/"
-    elif is_vcg_uvic():
-        data_dir = "/data/datasets/sfm/scenedata_splits/"
-    elif is_cvlab_epfl():
-        data_dir = "/cvlabdata2/home/kyi/Datasets/scenedata_splits/"
-    else:
-        data_dir = "./datasets/"
+    # if is_computecanada():
+    #     data_dir = "/scratch/kyi/datasets/scenedata_splits/"
+    # elif is_vcg_uvic():
+    #     data_dir = "/data/datasets/sfm/scenedata_splits/"
+    # else:
+    #     data_dir = "/cvlabdata2/home/kyi/Datasets/scenedata_splits/"
+
+    data_dir = "/cvlabdata2/home/kyi/Datasets/scenedata_splits/"
+    # data_dir = "Users/Zheng/Desktop/learned-correspondence/scenedata_splits/"
+    # data_dir = "/home/zdang/scratch/datasets/"
 
     # Expand the abbreviations that we use to actual folder names
     if "cogsci4" == dataset_name:
@@ -213,7 +219,7 @@ def setup_dataset(dataset_name):
         # Load the data
         data_dir += "reichstag/"
         geom_type = "Calibration"
-        vis_th = 100
+        vis_th = 400
     elif "sacre_coeur" == dataset_name:
         # Load the data
         data_dir += "sacre_coeur/"
@@ -233,7 +239,7 @@ def setup_dataset(dataset_name):
         # Load the data
         data_dir += "st_peters_square/"
         geom_type = "Calibration"
-        vis_th = 100
+        vis_th = 2000
     elif "harvard_conf_big" == dataset_name:
         # Load the data
         data_dir += "harvard_conf_big---hv_conf_big_1---skip-10-dilate-25/"
@@ -413,7 +419,10 @@ def setup_dataset(dataset_name):
         data_dir += "hotel_pedraza---hotel_room_pedraza_2012_nov_25-maxpairs-10000-random---skip-10-dilate-25/"
         geom_type = "Calibration"
         vis_th = 0.5
-
+    # todo: temperal
+    elif "outlier-rejection" == dataset_name:
+        geom_type = "Calibration"
+        vis_th = 0
     return data_dir, geom_type, vis_th
 
 

@@ -38,7 +38,7 @@ from __future__ import print_function
 
 from config import get_config, print_usage
 from data import load_data
-from network import MyNetwork
+from network import OutliersNetwork
 
 eps = 1e-10
 use3d = False
@@ -54,7 +54,7 @@ def main(config):
     """The main function."""
 
     # Initialize network
-    mynet = MyNetwork(config)
+    mynet = OutliersNetwork(config)
 
     # Run propper mode
     if config.run_mode == "train":
@@ -63,7 +63,6 @@ def main(config):
         data = {}
         data["train"] = load_data(config, "train")
         data["valid"] = load_data(config, "valid")
-
         # Run train
         mynet.train(data)
 

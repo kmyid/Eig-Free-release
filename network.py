@@ -39,11 +39,9 @@ import tensorflow as tf
 from parse import parse
 from tqdm import trange
 
-from ops import tf_skew_symmetric
-from tests import comp_process, test_process
+from tests import test_process
 
-
-class MyNetwork(object):
+class OutliersNetwork(object):
     """Network class """
 
     def __init__(self, config):
@@ -52,7 +50,7 @@ class MyNetwork(object):
 
         # Initialize thenosrflow session
         self._init_tensorflow()
-
+        print("Initial setting is done!")
         # Build the network
         self._build_placeholder()
         self._build_preprocessing()
@@ -78,18 +76,15 @@ class MyNetwork(object):
             )
         else:
             tfconfig = tf.ConfigProto()
-
         tfconfig.gpu_options.allow_growth = True
-
         self.sess = tf.Session(config=tfconfig)
 
     def _build_placeholder(self):
         """Build placeholders."""
 
         # Make tensforflow placeholder
-        self.x_in = tf.placeholder(tf.float32, [None, 1, None, 4], name="x_in")
-        self.y_in = tf.placeholder(tf.float32, [None, None, 2], name="y_in")
-        self.R_in = tf.placeholder(tf.float32, [None, 9], name="R_in")
+        self.x_in = tf.placeholder(tf.float32, [None, 1, None, 5], name="x_in")
+        self.R_in = tf.placeholder(tf.float32, [None, 3, 3], name="R_in")
         self.t_in = tf.placeholder(tf.float32, [None, 3], name="t_in")
         self.is_training = tf.placeholder(tf.bool, (), name="is_training")
 
@@ -122,118 +117,57 @@ class MyNetwork(object):
             # ---------------------------------------------------------------
 
             # Turn into weights for each sample
-            weights = tf.nn.relu(tf.tanh(self.logits))
-
-            # Make input data (num_img_pair x num_corr x 4)
-            xx = tf.transpose(tf.reshape(
-                self.x_in, (x_shp[0], x_shp[2], 4)), (0, 2, 1))
-
-            # Create the matrix to be used for the eight-point algorithm
-            X = tf.transpose(tf.stack([
-                xx[:, 2] * xx[:, 0], xx[:, 2] * xx[:, 1], xx[:, 2],
-                xx[:, 3] * xx[:, 0], xx[:, 3] * xx[:, 1], xx[:, 3],
-                xx[:, 0], xx[:, 1], tf.ones_like(xx[:, 0])
-            ], axis=1), (0, 2, 1))
-            print("X shape = {}".format(X.shape))
-            wX = tf.reshape(weights, (x_shp[0], x_shp[2], 1)) * X
-            print("wX shape = {}".format(wX.shape))
-            XwX = tf.matmul(tf.transpose(X, (0, 2, 1)), wX)
-            print("XwX shape = {}".format(XwX.shape))
-
-            # Recover essential matrix from self-adjoing eigen
-            e, v = tf.self_adjoint_eig(XwX)
-            self.e_hat = tf.reshape(v[:, :, 0], (x_shp[0], 9))
-            # Make unit norm just in case
-            self.e_hat /= tf.norm(self.e_hat, axis=1, keep_dims=True)
+            self.w = tf.nn.relu(tf.tanh(self.logits)) # bs, n ,2
 
     def _build_loss(self):
-        """Build our cross entropy loss."""
+        """Build loss"""
 
         with tf.variable_scope("Loss", reuse=tf.AUTO_REUSE):
+            x = self.x_in
+            R = self.R_in
+            t = self.t_in
+            # delta_u = self.delta[:, :, 0]
+            # delta_v = self.delta[:, :, 1]
+            Xw = tf.expand_dims(x[:,0,:,2], axis=-1)
+            Yw = tf.expand_dims(x[:,0,:,3], axis=-1)
+            Zw = tf.expand_dims(x[:,0,:,4], axis=-1)
+            ones = tf.ones_like(Xw, dtype=tf.float32)
+            zeros = tf.zeros_like(Xw, dtype=tf.float32)
+            u = x[:,0,:,0][..., None] #+ delta_u[..., None]
+            v = x[:,0,:,1][..., None] #+ delta_v[..., None]
 
-            x_shp = tf.shape(self.x_in)
-            # The groundtruth epi sqr
-            gt_geod_d = self.y_in[:, :, 0]
-            # tf.summary.histogram("gt_geod_d", gt_geod_d)
+            M1n = tf.concat([Xw, Yw, Zw, ones, zeros, zeros, zeros, zeros, -u*Xw, -u*Yw, -u*Zw, -u],axis=2)
+            M2n = tf.concat([zeros, zeros, zeros, zeros, Xw, Yw, Zw, ones, -v*Xw, -v*Yw, -v*Zw, -v],axis=2)
+            M = tf.concat([M1n, M2n], axis=1) # bs, 2*kps, 12
 
-            # Get groundtruth Essential matrix
-            e_gt_unnorm = tf.reshape(tf.matmul(
-                tf.reshape(tf_skew_symmetric(self.t_in), (x_shp[0], 3, 3)),
-                tf.reshape(self.R_in, (x_shp[0], 3, 3))
-            ), (x_shp[0], 9))
-            e_gt = e_gt_unnorm / tf.norm(e_gt_unnorm, axis=1, keep_dims=True)
+            w_2n = tf.concat([self.w, self.w], axis=-1)
+            M_t = tf.transpose(M, [0, 2, 1])
+            wM = tf.expand_dims(w_2n, axis=-1) * M
+            MwM = tf.matmul(M_t, wM)
+            x_shp = tf.shape(x)
 
-            # e_hat = tf.reshape(tf.matmul(
-            #     tf.reshape(t_hat, (-1, 3, 3)),
-            #     tf.reshape(r_hat, (-1, 3, 3))
-            # ), (-1, 9))
+            with tf.variable_scope("GT"):
+                e_gt = tf.reshape(tf.concat([R, tf.expand_dims(t,axis=-1)], axis=-1), (-1,12)) # bs, 12
+                e_gt /= tf.norm(e_gt, axis=1, keepdims=True)
+                e_gt = tf.expand_dims(e_gt, axis=-1)
 
-            # Essential matrix loss
-            essential_loss = tf.reduce_mean(tf.minimum(
-                tf.reduce_sum(tf.square(self.e_hat - e_gt), axis=1),
-                tf.reduce_sum(tf.square(self.e_hat + e_gt), axis=1)
-            ))
-            tf.summary.scalar("essential_loss", essential_loss)
+            with tf.variable_scope("Denoise"):
+                e_gt_t = tf.transpose(e_gt, [0, 2, 1])
+                d_term = tf.matmul(tf.matmul(e_gt_t, MwM), e_gt)
 
-            # Classification loss
-            is_pos = tf.to_float(
-                gt_geod_d < self.config.obj_geod_th
-            )
-            is_neg = tf.to_float(
-                gt_geod_d >= self.config.obj_geod_th
-            )
-            c = is_pos - is_neg
-            classif_losses = -tf.log(tf.nn.sigmoid(c * self.logits))
+                e_hat = tf.eye(12, batch_shape=[x_shp[0]], dtype=tf.float32) - tf.matmul(e_gt, e_gt_t)
+                e_hat_t = tf.transpose(e_hat, [0,2,1])
+                XwX_e_neg = tf.matmul(tf.matmul(e_hat_t, MwM), e_hat)
+                r_term = tf.trace(XwX_e_neg)
+                beta = self.config.beta
+                alpha = self.config.alpha
+                self.loss = tf.reduce_mean(d_term + alpha*tf.exp(- beta*r_term))
 
-            # balance
-            num_pos = tf.nn.relu(tf.reduce_sum(is_pos, axis=1) - 1.0) + 1.0
-            num_neg = tf.nn.relu(tf.reduce_sum(is_neg, axis=1) - 1.0) + 1.0
-            classif_loss_p = tf.reduce_sum(
-                classif_losses * is_pos, axis=1
-            )
-            classif_loss_n = tf.reduce_sum(
-                classif_losses * is_neg, axis=1
-            )
-            classif_loss = tf.reduce_mean(
-                classif_loss_p * 0.5 / num_pos +
-                classif_loss_n * 0.5 / num_neg
-            )
-            tf.summary.scalar("classif_loss", classif_loss)
-            tf.summary.scalar(
-                "classif_loss_p",
-                tf.reduce_mean(classif_loss_p * 0.5 / num_pos))
-            tf.summary.scalar(
-                "classif_loss_n",
-                tf.reduce_mean(classif_loss_n * 0.5 / num_neg))
-            precision = tf.reduce_mean(
-                tf.reduce_sum(tf.to_float(self.logits > 0) * is_pos, axis=1) /
-                tf.reduce_sum(tf.to_float(self.logits > 0) *
-                              (is_pos + is_neg), axis=1)
-            )
-            tf.summary.scalar("precision", precision)
-            recall = tf.reduce_mean(
-                tf.reduce_sum(tf.to_float(self.logits > 0) * is_pos, axis=1) /
-                tf.reduce_sum(is_pos, axis=1)
-            )
-            tf.summary.scalar("recall", recall)
-
-            # L2 loss
-            for var in tf.trainable_variables():
-                if "weights" in var.name:
-                    tf.add_to_collection("l2_losses", tf.reduce_sum(var**2))
-            l2_loss = tf.add_n(tf.get_collection("l2_losses"))
-            tf.summary.scalar("l2_loss", l2_loss)
-
-            # Check global_step and add essential loss
-            self.loss = self.config.loss_decay * l2_loss
-            if self.config.loss_essential > 0:
-                self.loss += (
-                    self.config.loss_essential * essential_loss * tf.to_float(
-                        self.global_step >= tf.to_int64(
-                            self.config.loss_essential_init_iter)))
-            if self.config.loss_classif > 0:
-                self.loss += self.config.loss_classif * classif_loss
-
+                # d_term = tf.squeeze(d_term, axis=-1)
+                # r_term = tf.norm(self.delta, axis=-1, ord=2)
+                # r_term = tf.reduce_mean(r_term, axis=-1, keepdims=True)
+                # beta = self.config.beta
+                # self.loss = tf.reduce_mean(d_term + beta * r_term)
             tf.summary.scalar("loss", self.loss)
 
     def _build_optim(self):
@@ -263,7 +197,7 @@ class MyNetwork(object):
                     if grad is not None:
                         grad = tf.check_numerics(
                             grad, "Numerical error in gradient for {}"
-                            "".format(var.name))
+                                  "".format(var.name))
                     new_grads_and_vars.append((grad, var))
 
                 # Should only apply grads once they are safe
@@ -345,12 +279,12 @@ class MyNetwork(object):
             Validation labels.
 
         """
-
         # ----------------------------------------
         # Resume data if it already exists
         latest_checkpoint = tf.train.latest_checkpoint(
             self.res_dir_tr)
         b_resume = latest_checkpoint is not None
+
         if b_resume:
             # Restore network
             print("Restoring from {}...".format(
@@ -372,18 +306,17 @@ class MyNetwork(object):
             print("Starting from scratch...")
             step = 0
             best_va_res = -1
+            print("Initializing all the parameter...")
+            self.sess.run(tf.global_variables_initializer())
 
         # ----------------------------------------
         # Unpack some data for simple coding
         xs_tr = data["train"]["xs"]
-        ys_tr = data["train"]["ys"]
         Rs_tr = data["train"]["Rs"]
         ts_tr = data["train"]["ts"]
 
         # ----------------------------------------
         # The training loop
-        print("Initializing...")
-        self.sess.run(tf.global_variables_initializer())
         batch_size = self.config.train_batch_size
         max_iter = self.config.train_iter
         for step in trange(step, max_iter, ncols=self.config.tqdm_width):
@@ -400,13 +333,10 @@ class MyNetwork(object):
             # Actual construction of the batch
             xs_b = np.array(
                 [xs_tr[_i][:, :cur_num_kp, :] for _i in ind_cur]
-            ).reshape(batch_size, 1, cur_num_kp, 4)
-            ys_b = np.array(
-                [ys_tr[_i][:cur_num_kp, :] for _i in ind_cur]
-            ).reshape(batch_size, cur_num_kp, 2)
+            ).reshape(batch_size, 1, cur_num_kp, 5)
             Rs_b = np.array(
                 [Rs_tr[_i] for _i in ind_cur]
-            ).reshape(batch_size, 9)
+            ).reshape(batch_size, 3, 3)
             ts_b = np.array(
                 [ts_tr[_i] for _i in ind_cur]
             ).reshape(batch_size, 3)
@@ -417,7 +347,6 @@ class MyNetwork(object):
             # Feed Dict
             feed_dict = {
                 self.x_in: xs_b,
-                self.y_in: ys_b,
                 self.R_in: Rs_b,
                 self.t_in: ts_b,
                 self.is_training: True,
@@ -432,6 +361,7 @@ class MyNetwork(object):
             if b_write_summary or b_validate:
                 fetch["summary"] = self.summary_op
                 fetch["global_step"] = self.global_step
+
             # Run optimization
             try:
                 res = self.sess.run(fetch, feed_dict=feed_dict)
@@ -445,7 +375,7 @@ class MyNetwork(object):
                     res["summary"], global_step=res["global_step"])
                 self.saver_cur.save(
                     self.sess, self.save_file_cur,
-                    global_step=self.global_step,
+                    global_step=res["global_step"],
                     write_meta_graph=False)
 
             # ----------------------------------------
@@ -453,15 +383,10 @@ class MyNetwork(object):
             if b_validate:
                 va_res = 0
                 cur_global_step = res["global_step"]
-                va_res = test_process(
-                    "valid", self.sess, cur_global_step,
-                    self.summary_op, self.summary_va,
-                    self.x_in, self.y_in, self.R_in, self.t_in,
-                    self.is_training,
-                    None, None, None,
-                    self.logits, self.e_hat, self.loss,
-                    data["valid"],
-                    self.res_dir_va, self.config, True)
+                va_res = test_process("valid", self.sess, cur_global_step, self.summary_va,
+                                              self.x_in, self.R_in, self.t_in, self.is_training,
+                                              data["valid"], self.res_dir_va, self.config, True,
+                                              w=self.w, delta=None)
                 # Higher the better
                 if va_res > best_va_res:
                     print(
@@ -492,35 +417,15 @@ class MyNetwork(object):
         self.saver_best.restore(
             self.sess,
             self.save_file_best)
-
         # Run Test
         cur_global_step = 0     # dummy
-        if self.config.vis_dump:
-            test_mode_list = ["test"]
-        else:
-            # test_mode_list = ["valid", "test"]
-            test_mode_list = ["test"]  # Only run testing
+
+        test_mode_list = ["test"]
         for test_mode in test_mode_list:
-            test_process(
-                test_mode, self.sess,
-                cur_global_step,
-                self.summary_op, getattr(self, "summary_" + test_mode[:2]),
-                self.x_in, self.y_in, self.R_in, self.t_in,
-                self.is_training,
-                None, None, None,
-                self.logits, self.e_hat, self.loss, data[test_mode],
-                getattr(self, "res_dir_" + test_mode[:2]), self.config)
-
-    def comp(self, data):
-        """Goodie for competitors"""
-
-        # Run competitors on dataset
-        for test_mode in ["test", "valid"]:
-            comp_process(
-                test_mode,
-                data[test_mode],
-                getattr(self, "res_dir_" + test_mode[:2]), self.config)
-
+            te_res = test_process(test_mode, self.sess, cur_global_step, self.summary_va,
+                                          self.x_in, self.R_in, self.t_in, self.is_training,
+                                          data[test_mode], self.res_dir_va,
+                                          self.config, False, w=self.w, delta=None)
 
 #
 # network.py ends here
